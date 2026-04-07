@@ -1,0 +1,307 @@
+"""
+Emotion + Eye Blink + Voice AI Assistant + Serial Signals
+MANUAL SERIAL PORT VERSION (Stable)
+"""
+
+import sys, os, time, threading, argparse
+import cv2
+import torch
+import numpy as np
+import torchvision.transforms.transforms as transforms
+import speech_recognition as sr
+import serial
+from groq import Groq
+from scipy.spatial import distance
+from imutils import face_utils
+import dlib
+import pyttsx3
+
+from face_detector.face_detector import DnnDetector, HaarCascadeDetector
+from model.model import Mini_Xception
+from utils import get_label_emotion, histogram_equalization
+from face_alignment.face_alignment import FaceAlignment
+
+# ---------------- CONFIG ---------------- #
+SERIAL_PORT = 'COM3'   # 🔴 CHANGE THIS (e.g., COM5)
+BAUD_RATE = 9600
+
+# ---------------- DEVICE ---------------- #
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ---------------- GROQ ---------------- #
+client = Groq(api_key="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")
+
+
+# ---------------- SERIAL ---------------- #
+ser = None
+try:
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+    time.sleep(2)
+    print(f"✅ Connected to {SERIAL_PORT}")
+except Exception as e:
+    print(f"❌ Serial error on {SERIAL_PORT}:", e)
+    ser = None
+
+# ---------------- SAFE SERIAL ---------------- #
+last_signal = None
+
+def send_signal(data):
+    global ser
+    if ser:
+        try:
+            ser.write(data)
+        except Exception as e:
+            print("Serial write error:", e)
+            ser = None
+
+def send_signal_once(data):
+    global last_signal
+    if data != last_signal:
+        send_signal(data)
+        last_signal = data
+
+# ---------------- TTS ---------------- #
+def speak(text):
+    try:
+        engine = pyttsx3.init()
+        engine.setProperty('rate', 170)
+        engine.setProperty('volume', 1.0)
+
+        send_signal(b'2')  # speaking start
+        
+        engine.say(text)
+        time.sleep(1)
+        engine.runAndWait()
+        engine.stop()
+        send_signal(b'3')  # speaking end
+
+    except Exception as e:
+        print("TTS Error:", e)
+
+# ---------------- SPEECH ---------------- #
+recognizer = sr.Recognizer()
+
+def listen():
+    try:
+        with sr.Microphone() as source:
+            recognizer.adjust_for_ambient_noise(source, duration=0.5)
+            print("🎤 Listening...")
+            audio = recognizer.listen(source, timeout=5, phrase_time_limit=5)
+
+        text = recognizer.recognize_google(audio)
+        print("User:", text)
+        return text
+
+    except:
+        print("Voice input failed")
+        return None
+
+# ---------------- LLM ---------------- #
+def ask_llm(prompt: str) -> str:
+    response = client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=[
+            {"role": "system", "content": "Reply in ONE short sentence only."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.6,
+        max_tokens=60
+    )
+    return response.choices[0].message.content.strip()
+
+# ---------------- EYE ---------------- #
+def eye_aspect_ratio(eye):
+    A = distance.euclidean(eye[1], eye[5])
+    B = distance.euclidean(eye[2], eye[4])
+    C = distance.euclidean(eye[0], eye[3])
+    return (A + B) / (2.0 * C)
+
+EYE_THRESH = 0.25
+EYE_CONSEC_FRAMES = 8
+eye_counter = 0
+
+detector_dlib = dlib.get_frontal_face_detector()
+predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
+
+(lStart, lEnd) = face_utils.FACIAL_LANDMARKS_68_IDXS["left_eye"]
+(rStart, rEnd) = face_utils.FACIAL_LANDMARKS_68_IDXS["right_eye"]
+
+# ---------------- HEAD ---------------- #
+HEAD_ROTATION_THRESHOLD = 40
+
+def get_head_pose(shape, frame_size):
+    model_points = np.array([
+        (0.0, 0.0, 0.0),
+        (0.0, -330.0, -65.0),
+        (-225.0, 170.0, -135.0),
+        (225.0, 170.0, -135.0),
+        (-150.0, -150.0, -125.0),
+        (150.0, -150.0, -125.0)
+    ])
+
+    image_points = np.array([
+        shape[30], shape[8], shape[36],
+        shape[45], shape[48], shape[54]
+    ], dtype="double")
+
+    focal_length = frame_size[1]
+    center = (frame_size[1] / 2, frame_size[0] / 2)
+
+    camera_matrix = np.array([
+        [focal_length, 0, center[0]],
+        [0, focal_length, center[1]],
+        [0, 0, 1]
+    ], dtype="double")
+
+    dist_coeffs = np.zeros((4, 1))
+
+    _, rotation_vector, _ = cv2.solvePnP(
+        model_points, image_points, camera_matrix, dist_coeffs
+    )
+
+    rmat, _ = cv2.Rodrigues(rotation_vector)
+    angles, _, _, _, _, _ = cv2.RQDecomp3x3(rmat)
+
+    return angles
+
+# ---------------- VOICE THREAD ---------------- #
+voice_thread = None
+voice_lock = threading.Lock()
+
+def voice_interaction(emotion):
+    global voice_thread
+
+    try:
+        reply = ask_llm(f"User looks {emotion}. Respond briefly.")
+        print("AI:", reply)
+        speak(reply)
+
+        user_input = listen()
+        if user_input:
+            follow = ask_llm(user_input)
+            print("AI:", follow)
+            speak(follow)
+
+    except Exception as e:
+        print("Voice error:", e)
+
+    finally:
+        with voice_lock:
+            voice_thread = None
+
+# ---------------- MAIN ---------------- #
+def main(args):
+    global eye_counter, voice_thread
+
+    model = Mini_Xception().to(device)
+    model.eval()
+    checkpoint = torch.load(args.pretrained, map_location=device)
+    model.load_state_dict(checkpoint['mini_xception'])
+
+    face_alignment = FaceAlignment()
+    face_detector = HaarCascadeDetector('face_detector') if args.haar else DnnDetector('face_detector')
+
+    video = cv2.VideoCapture(0)
+
+    stable_emotion = None
+    emotion_counter = 0
+    triggered = False
+    STABLE_THRESHOLD = 5
+    cooldown_time = 10
+    last_trigger_time = 0
+
+    send_signal_once(b'4')
+
+    while video.isOpened():
+        ret, frame = video.read()
+        if not ret:
+            break
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        subjects = detector_dlib(gray, 0)
+
+        for subject in subjects:
+            shape = predictor(gray, subject)
+            shape = face_utils.shape_to_np(shape)
+
+            pitch, yaw, roll = get_head_pose(shape, frame.shape)
+
+            if abs(yaw) > HEAD_ROTATION_THRESHOLD:
+                send_signal_once(b'1')
+
+            leftEye = shape[lStart:lEnd]
+            rightEye = shape[rStart:rEnd]
+
+            ear = (eye_aspect_ratio(leftEye) + eye_aspect_ratio(rightEye)) / 2.0
+
+            if ear < EYE_THRESH:
+                eye_counter += 1
+                if eye_counter >= EYE_CONSEC_FRAMES:
+                    cv2.putText(frame, "DROWSINESS ALERT!", (10,30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255),2)
+                    send_signal_once(b'5')
+            else:
+                eye_counter = 0
+                send_signal_once(b'4')
+
+        # Emotion + voice
+        faces = face_detector.detect_faces(frame)
+        for face in faces:
+            (x, y, w, h) = face
+
+            input_face = face_alignment.frontalize_face(face, frame)
+            input_face = cv2.resize(input_face, (48,48))
+            input_face = histogram_equalization(input_face)
+
+            input_face = transforms.ToTensor()(input_face).to(device)
+            input_face = torch.unsqueeze(input_face, 0)
+
+            with torch.no_grad():
+                pred = model(input_face)
+                emotion = get_label_emotion(torch.argmax(pred).item())
+             # ✅ -------- ADDED EMOTION DISPLAY --------
+            cv2.rectangle(frame, (x, y), (x+w, y+h), (0,255,0), 2)
+            cv2.putText(frame, f"Emotion: {emotion}", (x, y-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+
+            if emotion == stable_emotion:
+                emotion_counter += 1
+            else:
+                stable_emotion = emotion
+                emotion_counter = 1
+                triggered = False
+
+            if (emotion_counter >= STABLE_THRESHOLD and not triggered and
+                time.time() - last_trigger_time > cooldown_time):
+
+                with voice_lock:
+                    if voice_thread is None:
+                        voice_thread = threading.Thread(
+                            target=voice_interaction,
+                            args=(stable_emotion,)
+                        )
+                        voice_thread.start()
+
+                triggered = True
+                last_trigger_time = time.time()
+
+        cv2.imshow("AI Assistant", frame)
+
+        if cv2.waitKey(1) & 0xFF == 27:
+            break
+
+    video.release()
+    cv2.destroyAllWindows()
+
+    if ser:
+        ser.close()
+
+# ---------------- ENTRY ---------------- #
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--haar', action='store_true')
+    parser.add_argument('--pretrained', type=str,
+                        default='checkpoint/model_weights/weights_epoch_75.pth.tar')
+    args = parser.parse_args()
+
+    main(args)
